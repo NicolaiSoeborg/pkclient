@@ -49,6 +49,11 @@ func New(hsmPath string, slot uint, pin string) (*PKClient, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	if uint(len(slots)) <= slot {
+		return nil, fmt.Errorf("Requested slot (%d) but only %d available", slot, len(slots))
+	}
+
 	// try to open a session on the slot
 	client.HSM_Session.session, err = slots[slot].OpenWriteSession()
 	if err != nil {
