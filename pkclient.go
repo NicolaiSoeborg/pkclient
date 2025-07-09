@@ -12,11 +12,16 @@ import (
 )
 
 const (
-	CURVE25519_OID_RAW  = "06032B656E"
+	CURVE25519_OID_RAW  = "06032B656E"  // 1.3.101.110 ("id-X25519")
 	NoisePrivateKeySize = 32
 	NoisePublicKeySize  = 32
 	ERROR_PUBKEY_HSM    = "error getting public key from hsm"
 )
+
+type DeriveKeyPair struct {
+    publicKey  p11.Object
+    privateKey p11.Object
+}
 
 type PKClient struct {
 	HSM_Session struct {
@@ -81,21 +86,19 @@ func New(hsmPath string, slot uint, pin string) (*PKClient, error) {
 			return nil, err
 		}
 	}
-	client.HSM_Session.loggedIn = true
 	// login successful
+	client.HSM_Session.loggedIn = true
 
-	// make sure the hsm has a private curve25519 key for deriving
-	client.HSM_Session.privKeyObj, err = client.findDeriveKey(false)
+	// make sure the hsm has a curve25519 key for deriving
+	X25519KeyPair, err := client.findDeriveKey()
 	if err != nil {
-		err = fmt.Errorf("failed to find private key for deriving: %w", err)
+		err = fmt.Errorf("failed to find X25519 key for deriving: %w", err)
 		return nil, err
 	}
-	// find the public key of the private key, so we can pass it to the caller later
-	client.HSM_Session.pubKeyObj, err = client.findDeriveKey(true)
-	if err != nil {
-		err = fmt.Errorf("failed to find public key for deriving %w", err)
-		return nil, err
-	}
+
+	client.HSM_Session.pubKeyObj = X25519KeyPair.publicKey
+	client.HSM_Session.privKeyObj = X25519KeyPair.privateKey
+
 	return client, nil
 }
 
@@ -204,27 +207,39 @@ func (client *PKClient) DeriveNoise(peerPubKey [NoisePublicKeySize]byte) (secret
 }
 
 // Try to find a suitable key on the hsm for x25519 key derivation
-// parameter GET_PUB_KEY sets the search pattern for a public or private key
-func (dev *PKClient) findDeriveKey(GET_PUB_KEY bool) (key p11.Object, err error) {
+func (dev *PKClient) findDeriveKey() (keys DeriveKeyPair, err error) {
 	//  EC_PARAMS value: the specifc OID for x25519 operation
 	rawOID, _ := hex.DecodeString(CURVE25519_OID_RAW)
+	keys = DeriveKeyPair{}
 
-	keyAttrs := []*pkcs11.Attribute{
+	privateAttrs := []*pkcs11.Attribute{
 		pkcs11.NewAttribute(pkcs11.CKA_EC_PARAMS, rawOID),
+		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY),
 		pkcs11.NewAttribute(pkcs11.CKA_DERIVE, true),
 	}
 
-	var keyType *pkcs11.Attribute
-	if GET_PUB_KEY {
-		keyType = pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PUBLIC_KEY)
-	} else {
-		keyType = pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY)
-	}
-	keyAttrs = append(keyAttrs, keyType)
-
-	key, err = dev.HSM_Session.session.FindObject(keyAttrs)
+	// FindObject expects a single key with above attrs, otherwise it returns err
+	keys.privateKey, err = dev.HSM_Session.session.FindObject(privateAttrs)
 	if err != nil {
-		return key, err
+		return keys, err
 	}
-	return key, nil
+
+	CkaId, err := keys.privateKey.Attribute(pkcs11.CKA_ID);
+	if err != nil {
+		return keys, fmt.Errorf("Could not find CKA_ID of private key to derive public key")
+	}
+
+	publicAttrs := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_EC_PARAMS, rawOID),
+		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PUBLIC_KEY),
+		//pkcs11.NewAttribute(pkcs11.CKA_DERIVE, true),
+		pkcs11.NewAttribute(pkcs11.CKA_ID, CkaId),
+	}
+
+	keys.publicKey, err = dev.HSM_Session.session.FindObject(publicAttrs)
+	if err != nil {
+		return keys, err
+	}
+
+	return keys, nil
 }
