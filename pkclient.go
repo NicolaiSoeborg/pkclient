@@ -1,7 +1,6 @@
 package pkclient
 
 import (
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -15,7 +14,6 @@ const (
 	CURVE25519_OID_RAW  = "06032B656E"  // 1.3.101.110 ("id-X25519")
 	NoisePrivateKeySize = 32
 	NoisePublicKeySize  = 32
-	ERROR_PUBKEY_HSM    = "error getting public key from hsm"
 )
 
 type DeriveKeyPair struct {
@@ -117,52 +115,33 @@ func (client *PKClient) Close() {
 	client.HSM_Session.session.Logout()
 	client.HSM_Session.session.Close()
 	client.HSM_Session.module.Destroy()
-
-}
-
-// return the public key for the deriving key that was previously found
-// this will return whole raw value, it's up the caller to check the length
-// this will likely be the full EC_POINT. See PublicKeyNoise()
-func (client *PKClient) PublicKeyRaw() ([]byte, error) {
-
-	key, err := client.HSM_Session.pubKeyObj.Value()
-	if err != nil {
-		return key, err
-	}
-	return key, nil
 }
 
 // Returns a 32 byte length key from the hsm. attempts to convert to a usable WG key
 func (client *PKClient) PublicKeyNoise() (key [NoisePublicKeySize]byte, err error) {
 	if !client.HSM_Session.loggedIn {
-		err := fmt.Errorf("error: must login to hsm first")
-		var zkey [NoisePublicKeySize]byte // temp garbage key so we can return the error
-		return zkey, err
+		return [NoisePublicKeySize]byte{}, fmt.Errorf("error: must login to hsm first")
 	}
 
-	srcKey, err := client.HSM_Session.pubKeyObj.Value()
-
-	if err != nil || len(srcKey) < NoisePublicKeySize {
-		var zkey [NoisePublicKeySize]byte // temp garbage key so we can return the error
-		return zkey, err
+	// From my understanding, for X25519 the public key is not stored
+	// in `CKA_VALUE` but instead in attribute `CKA_EC_POINT`.
+	srcKey, err := client.HSM_Session.pubKeyObj.Attribute(pkcs11.CKA_EC_POINT);
+	if err != nil {
+		return [NoisePublicKeySize]byte{}, err
 	}
+	if len(srcKey) < NoisePublicKeySize {
+		return [NoisePublicKeySize]byte{}, fmt.Errorf("Key of wrong size returned (%d)", len(srcKey))
+	}
+
 	// On a Nitrokey Start, this gets the full EC_POINT value of 34 bytes instead of 32,
-	// so if it's > 32 bytes, just return the last 32 bytes.
-	if len(srcKey) > NoisePublicKeySize {
-		srcKey = srcKey[len(srcKey)-NoisePublicKeySize:]
+	// This returns the last 32 bytes.  TODO: check the discarded prefix.
+	if len(srcKey) == NoisePublicKeySize + 2 {
+		// fmt.Printf("DEBUG: Discarding prefix of key\n")
+		srcKey = srcKey[2:]
 	}
 
 	copy(key[:], srcKey[:])
 	return key, nil
-}
-
-// Returns a base64 encoded public key
-func (client *PKClient) PublicKeyB64() string {
-	srcKey, err := client.PublicKeyNoise()
-	if err != nil {
-		return ERROR_PUBKEY_HSM
-	}
-	return base64.StdEncoding.EncodeToString(srcKey[:])
 }
 
 // derive a shared secret using the input public key against the private key that was found during setup
@@ -221,24 +200,23 @@ func (dev *PKClient) findDeriveKey() (keys DeriveKeyPair, err error) {
 	// FindObject expects a single key with above attrs, otherwise it returns err
 	keys.privateKey, err = dev.HSM_Session.session.FindObject(privateAttrs)
 	if err != nil {
-		return keys, err
+		return keys, fmt.Errorf("Could not find private key with attrs: %w", err)
 	}
 
 	CkaId, err := keys.privateKey.Attribute(pkcs11.CKA_ID);
 	if err != nil {
-		return keys, fmt.Errorf("Could not find CKA_ID of private key to derive public key")
+		return keys, fmt.Errorf("Could not find CKA_ID of private key: %w", err)
 	}
 
 	publicAttrs := []*pkcs11.Attribute{
 		pkcs11.NewAttribute(pkcs11.CKA_EC_PARAMS, rawOID),
 		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PUBLIC_KEY),
-		//pkcs11.NewAttribute(pkcs11.CKA_DERIVE, true),
 		pkcs11.NewAttribute(pkcs11.CKA_ID, CkaId),
 	}
 
 	keys.publicKey, err = dev.HSM_Session.session.FindObject(publicAttrs)
 	if err != nil {
-		return keys, err
+		return keys, fmt.Errorf("Could not find public key: %w", err)
 	}
 
 	return keys, nil
