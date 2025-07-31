@@ -139,9 +139,11 @@ func (client *PKClient) PublicKeyNoise() (key [NoisePublicKeySize]byte, err erro
 	}
 
 	// On a Nitrokey Start, this gets the full EC_POINT value of 34 bytes instead of 32,
-	// This returns the last 32 bytes.  TODO: check the discarded prefix.
+	// This returns the last 32 bytes. Prefix "04 (OCTET STRING) 20 (of length 0x20)"
 	if len(srcKey) == NoisePublicKeySize + 2 {
-		// fmt.Printf("DEBUG: Discarding prefix of key\n")
+		if srcKey[0] != 0x40 || srcKey[1] != 0x20 {
+			return [NoisePublicKeySize]byte{}, fmt.Errorf("Wrong EC_POINT prefix (%X)", srcKey)
+		}
 		srcKey = srcKey[2:]
 	}
 
@@ -208,7 +210,7 @@ func (dev *PKClient) findDeriveKey() (keys DeriveKeyPair, err error) {
 		return keys, fmt.Errorf("Could not find private key with attrs: %w", err)
 	}
 
-	CkaId, err := keys.privateKey.Attribute(pkcs11.CKA_ID);
+	ckaId, err := keys.privateKey.Attribute(pkcs11.CKA_ID);
 	if err != nil {
 		return keys, fmt.Errorf("Could not find CKA_ID of private key: %w", err)
 	}
@@ -216,7 +218,7 @@ func (dev *PKClient) findDeriveKey() (keys DeriveKeyPair, err error) {
 	publicAttrs := []*pkcs11.Attribute{
 		pkcs11.NewAttribute(pkcs11.CKA_EC_PARAMS, rawOID),
 		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PUBLIC_KEY),
-		pkcs11.NewAttribute(pkcs11.CKA_ID, CkaId),
+		pkcs11.NewAttribute(pkcs11.CKA_ID, ckaId),
 	}
 
 	keys.publicKey, err = dev.HSM_Session.session.FindObject(publicAttrs)
