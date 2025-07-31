@@ -38,7 +38,6 @@ type PKClient struct {
 // A public and private key must already exist on the hsm
 // The private and match public key must also be found during setup
 // The private key must be the Curve25519 Algorithm, OID 1.3.101.110
-//
 func New(hsmPath string, slot uint, pin string) (*PKClient, error) {
 	client := new(PKClient)
 	module, err := p11.OpenModule(hsmPath)
@@ -124,40 +123,40 @@ func (client *PKClient) Close() {
 
 // Returns a 32 byte length key from the hsm. attempts to convert to a usable WG key
 func (client *PKClient) PublicKeyNoise() (key [NoisePublicKeySize]byte, err error) {
+	var nullKey [NoisePublicKeySize]byte // temp garbage key (all 0's) so we can return the error
 	if !client.HSM_Session.loggedIn {
-		return [NoisePublicKeySize]byte{}, fmt.Errorf("error: must login to hsm first")
+		return nullKey, fmt.Errorf("error: must login to HSM first")
 	}
 
 	// From my understanding, for X25519 the public key is not stored
 	// in `CKA_VALUE` but instead in attribute `CKA_EC_POINT`.
-	srcKey, err := client.HSM_Session.pubKeyObj.Attribute(pkcs11.CKA_EC_POINT);
+	// "DER-encoding of the public key value in little endian order as defined in RFC 7748"
+	// - https://docs.oasis-open.org/pkcs11/pkcs11-curr/v3.0/cs01/pkcs11-curr-v3.0-cs01.html
+	pubKeyVal, err := client.HSM_Session.pubKeyObj.Attribute(pkcs11.CKA_EC_POINT);
 	if err != nil {
-		return [NoisePublicKeySize]byte{}, err
+		return nullKey, err
 	}
-	if len(srcKey) < NoisePublicKeySize {
-		return [NoisePublicKeySize]byte{}, fmt.Errorf("Key of wrong size returned (%d)", len(srcKey))
-	}
-
-	// On a Nitrokey Start, this gets the full EC_POINT value of 34 bytes instead of 32,
-	// This returns the last 32 bytes. Prefix "04 (OCTET STRING) 20 (of length 0x20)"
-	if len(srcKey) == NoisePublicKeySize + 2 {
-		if srcKey[0] != 0x40 || srcKey[1] != 0x20 {
-			return [NoisePublicKeySize]byte{}, fmt.Errorf("Wrong EC_POINT prefix (%X)", srcKey)
+	if len(pubKeyVal) != NoisePublicKeySize {
+		// On a Nitrokey Start, this gets the full EC_POINT value of 34 bytes instead of 32,
+		// If prefix is "04 (OCTET STRING) 20 (of length 0x20)" then discard the prefix
+		// TODO: Probably this is correct and the returned value should always be 34 bytes!?
+		if len(pubKeyVal) == NoisePublicKeySize + 2 && pubKeyVal[0] == 0x40 && pubKeyVal[1] == 0x20 {
+			pubKeyVal = pubKeyVal[2:]
+		} else {
+			return nullKey, fmt.Errorf("Key of wrong size returned (%d)", len(pubKeyVal))
 		}
-		srcKey = srcKey[2:]
 	}
 
-	copy(key[:], srcKey[:])
+	copy(key[:], pubKeyVal[:])
 	return key, nil
 }
 
 // derive a shared secret using the input public key against the private key that was found during setup
 // returns a fixed 32 byte array
 func (client *PKClient) DeriveNoise(peerPubKey [NoisePublicKeySize]byte) (secret [NoisePrivateKeySize]byte, err error) {
+	var nullKey [NoisePublicKeySize]byte // temp garbage key (all 0's) so we can return the error
 	if !client.HSM_Session.loggedIn {
-		err := fmt.Errorf("error: must login to hsm first")
-		var zkey [NoisePublicKeySize]byte // temp garbage key so we can return the error
-		return zkey, err
+		return nullKey, fmt.Errorf("error: must login to HSM first")
 	}
 
 	var mech_mech uint = pkcs11.CKM_ECDH1_DERIVE
@@ -178,23 +177,24 @@ func (client *PKClient) DeriveNoise(peerPubKey [NoisePublicKeySize]byte) (secret
 	}
 
 	// setup the parameters which include the peer's public key
-	ecdhParams := pkcs11.NewECDH1DeriveParams(pkcs11.CKD_NULL, nil, peerPubKey[:NoisePublicKeySize])
+	ecdhParams := pkcs11.NewECDH1DeriveParams(pkcs11.CKD_NULL, nil, peerPubKey[:])
 
 	var mech *pkcs11.Mechanism = pkcs11.NewMechanism(mech_mech, ecdhParams)
 
 	// derive the secret key from the public key as input and the private key on the device
 	tmpKey, err := p11.PrivateKey(client.HSM_Session.privKeyObj).Derive(*mech, attrTemplate)
 	if err != nil {
-		return secret, err
+		return nullKey, err
 	}
-
-	copy(secret[:], tmpKey[:NoisePrivateKeySize])
-	return secret, err
+	if len(tmpKey) != NoisePrivateKeySize {
+		return nullKey, fmt.Errorf("Wrong size derived (%d)", len(tmpKey))
+	}
+	copy(secret[:], tmpKey[:])
+	return secret, nil
 }
 
 // Try to find a suitable key on the hsm for x25519 key derivation
 func (dev *PKClient) findDeriveKey() (keys DeriveKeyPair, err error) {
-	//  EC_PARAMS value: the specifc OID for x25519 operation
 	rawOID, _ := hex.DecodeString(CURVE25519_OID_RAW)
 	keys = DeriveKeyPair{}
 
